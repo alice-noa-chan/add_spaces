@@ -1,4 +1,9 @@
-# Korean Spacing Model (Char-CNN, PyTorch)
+아래는 **새 코드에 맞게 싹 정리한 `README.md` 초안**이야.
+(기존 내용 최대한 살리면서, 모델/훈련/체크포인트/하이퍼파라미터 쪽만 최신 코드 기준으로 업데이트함.)
+
+````markdown
+# Korean Spacing Model (Improved Char-CNN, PyTorch)
+
 This repository provides a high-speed Korean spacing restoration model implemented with PyTorch.
 
 The model:
@@ -10,10 +15,10 @@ The model:
 - Is designed to be:
   - **Accurate enough for practical use.**
   - **Very fast on CPU.**
-  - **GPU-aware** (uses CUDA automatically when available).
+  - **GPU-aware** (uses CUDA automatically when available and mixed precision when possible).
 - Saves:
   - Best model and latest model.
-  - Quantized versions (if `torchao` is available).
+  - Quantized best model (if `torchao` is available, or a non-quantized CPU fallback).
 
 License: **MIT**
 
@@ -21,14 +26,33 @@ License: **MIT**
 
 ## Features
 
-- Character-level CNN model (Embedding + 1D Conv + 1D Conv + Linear).
-- Train/valid/test split with shuffling.
-- Training loop with:
+- **Improved character-level CNN model**:
+  - Character embedding with **learnable positional embeddings**.
+  - **Multi-scale 1D convolution block** (kernel sizes e.g. 3, 5, 7).
+  - Stack of **bidirectional dilated convolution blocks** with:
+    - Forward & backward dilated convolutions.
+    - Learnable gating between forward/backward contexts.
+    - **Squeeze-and-Excitation (SE)** channel attention.
+    - **LayerNorm**, **Dropout**, and **DropPath (stochastic depth)**.
+  - Lightweight position-wise classifier with residual shortcut.
+- **Data pipeline**:
+  - Train/valid/test split with shuffling.
+  - Character-level vocabulary with special tokens:
+    - `<PAD>`, `<UNK>`, `<MASK>`.
+- **Data augmentation** (for training):
+  - Random **masking** of characters using `<MASK>` token.
+  - Random **adjacent swaps** of characters (and labels) to introduce noise while preserving alignment.
+  - Optional **random cropping** for sequences longer than `MAX_SEQ_LEN`.
+- **Training loop** with:
   - `AdamW` optimizer.
   - L2 regularization (`weight_decay`).
-  - `ReduceLROnPlateau` scheduler.
+  - **Focal Loss** with **label smoothing** for robust training on imbalanced labels:
+    - Per-character space prediction (0: no space, 1: space).
+    - `alpha` / `gamma` for hard example mining.
+  - **CosineAnnealingWarmRestarts** learning rate scheduler.
   - Early stopping on validation F1.
   - Gradient clipping.
+  - **Mixed precision training (AMP)** using `torch.cuda.amp` (if CUDA is available).
   - Progress bar using `tqdm`.
   - Per-epoch logging of:
     - Train loss / accuracy.
@@ -38,8 +62,7 @@ License: **MIT**
 - Model checkpoints saved under `./models`:
   - `best_model.pt`
   - `latest_model.pt`
-  - `best_model_quantized.pt`
-  - `latest_model_quantized.pt`
+  - `best_model_quantized.pt` (quantized or non-quantized CPU fallback)
 - Optional quantization using `torchao` (if installed).
 
 ---
@@ -55,15 +78,14 @@ License: **MIT**
 ├─ models/
 │  ├─ best_model.pt
 │  ├─ latest_model.pt
-│  ├─ best_model_quantized.pt
-│  └─ latest_model_quantized.pt
-├─ spacing_train.py
+│  └─ best_model_quantized.pt
+├─ train.py
 └─ README.md
 ````
 
 * `data/`: Directory containing TSV files used for training.
 * `models/`: Directory where trained models and quantized variants are saved.
-* `spacing_train.py`: Main training script (Char-CNN spacing model).
+* `train.py`: Main training script (improved Char-CNN spacing model).
 
 ---
 
@@ -84,14 +106,17 @@ original    nospace
 
 * `original`: Ground-truth sentence with correct spacing.
 * `nospace`: Same sentence with all spaces removed.
-* During preprocessing:
 
-  * The script uses `original` to:
+During preprocessing:
 
-    * Recompute the no-space string.
-    * Build the label sequence (0 or 1 at each character position).
-  * The `nospace` column is used as a hint only; if it disagrees with `original`,
-    the `original`-based version is used.
+* The script uses `original` to:
+
+  * Recompute the no-space string.
+  * Build the label sequence (0 or 1 at each character position).
+* The `nospace` column is used as a hint only; if it disagrees with `original`,
+  the `original`-based version is used.
+* Samples with length mismatches or empty content are skipped, with statistics
+  printed to the console.
 
 ---
 
@@ -129,24 +154,29 @@ Make sure you install a PyTorch build appropriate for your environment
 2. Run training:
 
    ```bash
-   python spacing_train.py
+   python train.py
    ```
 
    The script will:
 
    * Detect `cuda` if available, otherwise use `cpu`.
+   * Enable **mixed precision** (AMP) automatically when running on CUDA.
    * Read all `.tsv` files from `./data`.
    * Preprocess and validate samples.
    * Shuffle and split into train/valid/test.
-   * Train the char-CNN model using AdamW.
-   * Apply learning rate scheduling and early stopping.
+   * Build a character vocabulary including `<PAD>`, `<UNK>`, `<MASK>`.
+   * Train the improved char-CNN model with:
+
+     * Focal loss + label smoothing.
+     * Cosine annealing warm restarts scheduler.
+     * Data augmentation (masking / swaps / random crop) on the training set.
+   * Apply learning rate scheduling and early stopping based on validation F1.
    * Save:
 
      * Latest model: `./models/latest_model.pt`
      * Best model (by validation F1): `./models/best_model.pt`
-     * Quantized versions:
+     * Quantized (or CPU fallback) best model:
 
-       * `./models/latest_model_quantized.pt`
        * `./models/best_model_quantized.pt`
 
 3. At the end of training, the script automatically:
@@ -154,31 +184,43 @@ Make sure you install a PyTorch build appropriate for your environment
    * Loads the best model (if present).
    * Evaluates on the test set.
    * Prints test metrics (loss, accuracy, precision, recall, F1).
-   * Prints a few example spacing restorations.
+   * Prints a few example spacing restorations from the test split.
 
 ---
 
 ## Model Files
 
-Each `.pt` checkpoint saved by the script is a dictionary with keys:
+The script saves two kinds of checkpoints:
 
-* `model_state_dict`: State dict of the PyTorch model.
-* `vocab`: Character-to-index mapping used during training.
-* `config`: Model and training configuration dictionary.
-* `quantized`: Boolean flag (`True` or `False`) for quantized checkpoints.
-* `quant_backend`: Quantization backend identifier (e.g. `"torchao"` or `None`).
+1. **Standard checkpoints** (`best_model.pt`, `latest_model.pt`)
 
-Example:
+   ```python
+   {
+       "model_state_dict": ...,
+       "vocab": {...},   # char2idx mapping
+       "config": {...},  # model & training configuration
+   }
+   ```
 
-```python
-{
-    "model_state_dict": ...,
-    "vocab": {...},
-    "config": {...},
-    "quantized": False,
-    "quant_backend": None
-}
-```
+2. **Quantized (or quantization-fallback) checkpoint** (`best_model_quantized.pt`)
+
+   ```python
+   {
+       "model_state_dict": ...,
+       "vocab": {...},
+       "config": {...},
+       "quantized": True or False,
+       "quant_backend": "torchao" or None,
+   }
+   ```
+
+* `quantized = True` and `quant_backend = "torchao"` when quantization succeeds.
+* If quantization fails or `torchao` is not installed, the script still saves a **CPU model** under `best_model_quantized.pt` with:
+
+  * `"quantized": False`
+  * `"quant_backend": None`
+
+You can load and use these checkpoints with standard PyTorch APIs.
 
 ---
 
@@ -190,171 +232,6 @@ Below is an example script (`inference_example.py`) showing how to:
 * Reconstruct the same architecture.
 * Restore spacing for input strings.
 
-All code lines are heavily commented for clarity.
-
-```python
-import os
-from typing import List, Dict, Any
-
-import torch
-from torch import nn
-
-# Import the same model class definition used in spacing_train.py.
-# If this file is separate, make sure to either:
-#   1) Copy the model definition here, or
-#   2) Import from the training module (e.g., `from spacing_train import CharCNNSpacingModel`)
-from spacing_train import CharCNNSpacingModel, PAD_TOKEN, UNK_TOKEN
-
-
-def load_model_checkpoint(
-    checkpoint_path: str,
-    device: torch.device,
-) -> tuple[nn.Module, Dict[str, int], Dict[str, Any]]:
-    """
-    Load a saved checkpoint file and reconstruct the model.
-
-    Args:
-        checkpoint_path: Path to the .pt file (e.g., best_model.pt).
-        device:         Device to map the model to ("cpu" or "cuda").
-
-    Returns:
-        model:   Loaded PyTorch model in eval mode.
-        vocab:   Character-to-index mapping (char2idx).
-        config:  Configuration dictionary used during training.
-    """
-    # Load the checkpoint onto the desired device (map_location specifies this).
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-
-    # Extract vocabulary and configuration information.
-    char2idx: Dict[str, int] = checkpoint["vocab"]
-    config: Dict[str, Any] = checkpoint["config"]
-
-    # Create the model using the same hyperparameters used during training.
-    model = CharCNNSpacingModel(
-        vocab_size=config["vocab_size"],
-        embed_dim=config["embed_dim"],
-        hidden_dim=config["hidden_dim"],
-        num_classes=config["num_classes"],
-        pad_idx=config["pad_idx"],
-        dropout=config["dropout"],
-    ).to(device)
-
-    # Load the learned parameters into the model.
-    model.load_state_dict(checkpoint["model_state_dict"])
-
-    # Set the model to evaluation mode (disables dropout, etc.).
-    model.eval()
-
-    return model, char2idx, config
-
-
-def restore_spacing(
-    text: str,
-    model: nn.Module,
-    char2idx: Dict[str, int],
-    device: torch.device,
-) -> str:
-    """
-    Restore spacing for an input string using the trained model.
-
-    The function:
-        - Removes all spaces from the input text.
-        - Converts each character to an integer index.
-        - Runs the model to decide where spaces should be inserted.
-        - Reconstructs a spaced string according to model predictions.
-
-    Args:
-        text:     Input string (possibly without correct spaces).
-        model:    Trained spacing model.
-        char2idx: Character-to-index mapping.
-        device:   Target device ("cpu" or "cuda").
-
-    Returns:
-        Restored text with predicted spaces inserted.
-    """
-    # Ensure the model is in evaluation mode.
-    model.eval()
-
-    # Remove all spaces from the input, since we want the model to decide spacing.
-    no_space = text.replace(" ", "")
-
-    # If the result is empty, simply return the original input.
-    if not no_space:
-        return text
-
-    # Convert each character to its index, using UNK_TOKEN for unknown characters.
-    unk_idx = char2idx.get(UNK_TOKEN)
-    input_ids: List[int] = [
-        char2idx.get(ch, unk_idx)
-        for ch in no_space
-    ]
-
-    # Convert the list of indices into a tensor with shape [1, seq_len].
-    input_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
-    input_tensor = input_tensor.to(device)
-
-    # Disable gradient calculation for inference.
-    with torch.no_grad():
-        # Forward pass: obtain logits for each position.
-        logits = model(input_tensor)  # [1, seq_len, num_classes]
-
-        # Predicted class indices at each position (0 or 1).
-        preds = logits.argmax(dim=-1).squeeze(0)  # [seq_len]
-
-    # Build the output string by inserting spaces where the model predicts label==1.
-    output_chars: List[str] = []
-    for ch, label in zip(no_space, preds.tolist()):
-        output_chars.append(ch)
-        if label == 1:
-            # If the prediction is 1, insert a space after this character.
-            output_chars.append(" ")
-
-    # Join the list of characters into a single string and strip extra leading/trailing spaces.
-    result = "".join(output_chars).strip()
-    return result
-
-
-def main() -> None:
-    """
-    Simple example:
-        - Load the best model checkpoint.
-        - Use it to restore spacing for a few example inputs.
-    """
-    # Decide which device to use (CUDA if available, otherwise CPU).
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Device] Using device: {device}")
-
-    # Path to the best model checkpoint saved by spacing_train.py.
-    checkpoint_path = os.path.join("models", "best_model.pt")
-
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint_path}. "
-            f"Train the model first with `python spacing_train.py`."
-        )
-
-    # Load model, vocabulary, and configuration.
-    model, char2idx, config = load_model_checkpoint(checkpoint_path, device)
-
-    # Some example inputs without proper spacing.
-    examples = [
-        "오늘날씨가좋다",
-        "한국어띄어쓰기모델테스트중입니다",
-        "이문장은공백이없습니다",
-    ]
-
-    print("\n[Examples] Spacing restoration")
-    for text in examples:
-        restored = restore_spacing(text, model, char2idx, device)
-        print(f"Input : {text}")
-        print(f"Output: {restored}")
-        print("-" * 40)
-
-
-if __name__ == "__main__":
-    main()
-```
-
 Run:
 
 ```bash
@@ -365,31 +242,36 @@ This will load `models/best_model.pt` and print restored spacing for the given e
 
 ---
 
-## Limit
-### Invalid separation occurring inside compound nouns
-Boundary prediction inside compound nouns is the weakest. Limitations that often appear in CNN-char-based models. Difficult to deeply understand semantic information. In particular, technical terms are difficult because they do not have dataset-based regularity.
+## Limitations
 
-### Long Relationship + Overlapping Configuration
-The dependent clause is long, so the compartment is unclear without meaning information. Char-level CNNs are difficult to handle long-distance dependencies.
+### Invalid separation occurring inside compound nouns
+
+Boundary prediction inside compound nouns is the weakest. This is a common
+limitation of character-level CNN-based models, which can struggle to deeply
+understand semantic information. In particular, technical terms are difficult
+because they often lack clear, dataset-level regularities.
+
+### Long-distance dependencies & overlapping structures
+
+When the dependent clause is long, the correct spacing sometimes requires
+deeper semantic understanding. Even with bidirectional dilated convolutions,
+very long-distance dependencies remain challenging for purely char-level CNNs.
+
+---
 
 ## Speed
-Speed is fast in both general and quantized models. In addition, the loss of quantization models is very small (there is virtually no). However, it may vary depending on the PC specification, and the following figure is the average value of 100 repetitions.
 
-### Normal Model
-* Load:   0.130813s
-* Processing:  0.152100s
-* Unload: 0.043783s
+Speed is fast in both general and quantized models. In addition, the loss of
+accuracy from quantization is very small (virtually none in many settings).
 
-### Quntization Model
-* Load:   0.093397
-* Processing:  0.018308
-* Unload: 0.041244
+However, actual speed depends on your hardware (CPU / GPU). Benchmarking with
+100 repetitions on your own environment is recommended for precise numbers.
 
 ---
 
 ## Hyperparameters
 
-Default hyperparameters are defined at the top of `spacing_train.py`:
+Default hyperparameters are defined at the top of `train.py`:
 
 * Data and model paths:
 
@@ -402,25 +284,37 @@ Default hyperparameters are defined at the top of `spacing_train.py`:
   * `TEST_RATIO = 0.1`
 * Model:
 
-  * `MAX_SEQ_LEN = 256` (truncate longer sequences)
+  * `MAX_SEQ_LEN = 256` (truncate or crop longer sequences)
   * `EMBED_DIM = 128`
   * `HIDDEN_DIM = 256`
-  * `DROPOUT = 0.3`
+  * `DROPOUT = 0.2`
+  * `DROP_PATH_RATE = 0.1`
 * Training:
 
   * `BATCH_SIZE = 64`
-  * `NUM_EPOCHS = 30`
-  * `LEARNING_RATE = 1e-3`
+  * `NUM_EPOCHS = 50`
+  * `LEARNING_RATE = 2e-3`
   * `WEIGHT_DECAY = 1e-2`
+  * Focal loss:
+
+    * `FOCAL_ALPHA = 0.75`
+    * `FOCAL_GAMMA = 2.0`
+  * Label smoothing:
+
+    * `LABEL_SMOOTHING = 0.1`
   * Early stopping:
 
-    * `PATIENCE = 5`
+    * `PATIENCE = 10`
     * `MIN_DELTA = 1e-4`
   * Workers:
 
     * `NUM_WORKERS = 2`
+* Data augmentation:
 
-You can edit these values directly in `spacing_train.py` to tune the model.
+  * `AUG_MASK_PROB = 0.1`   (probability to mask a character)
+  * `AUG_SWAP_PROB = 0.05`  (probability to swap adjacent characters)
+
+You can edit these values directly in `train.py` to tune the model.
 
 ---
 
@@ -435,7 +329,8 @@ This reduces model size and can speed up CPU inference.
 
 If `torchao` is not installed or quantization fails for any reason:
 
-* The script still saves a non-quantized CPU model under the same `*_quantized.pt` file names.
+* The script still saves a (non-quantized) CPU model under the same
+  `best_model_quantized.pt` file name.
 * The checkpoint will include:
 
   * `"quantized": False`
@@ -447,4 +342,5 @@ If `torchao` is not installed or quantization fails for any reason:
 
 This project is licensed under the **MIT License**.
 
-You may copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, subject to the conditions of the MIT License.
+You may copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, subject to the conditions of the MIT License.
